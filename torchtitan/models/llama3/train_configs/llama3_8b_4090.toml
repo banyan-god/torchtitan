@@ -4,7 +4,6 @@
 [job]
 dump_folder = "./outputs"
 description = "Llama 3 8B training"
-init_device = "meta"
 
 [profiling]
 enable_profiling = true
@@ -32,16 +31,16 @@ warmup_steps = 200  # lr scheduler warm up
 
 [training]
 batch_size = 1
-grad_accum_steps = 4
-seq_len = 2048
+seq_len = 512
 max_norm = 1.0  # grad norm clipping
 steps = 1000
 compile = false
-dataset = "c4_test"
+dataset = "c4"
+enable_cpu_offload = true
 
 [parallelism]
 data_parallel_replicate_degree = 1
-data_parallel_shard_degree = 4
+data_parallel_shard_degree = -1
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
@@ -59,18 +58,6 @@ mode = "full"  # ["none", "selective", "full"]
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-# enable_fsdp_float8_all_gather = true
-# precompute_float8_dynamic_scale_for_fsdp = true
-# filter_fqns = ["output"]
-
-[fsdp2]
-cpu_offload.enable = true
-cpu_offload.pin_memory = true
-param_init_device = "meta"
-reshard_after_forward = "always"
-use_orig_params = true
-
-[fsdp2.mixed_precision]
-param_dtype  = "bf16"
-reduce_dtype = "bf16"
-buffer_dtype = "bf16"
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]
