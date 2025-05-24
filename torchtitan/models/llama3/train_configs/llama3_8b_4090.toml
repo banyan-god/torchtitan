@@ -19,7 +19,7 @@ save_tb_folder = "tb"
 name = "llama3"
 flavor = "1B"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-# converters = ["float8"]
+converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
@@ -57,6 +57,11 @@ mode = "full"  # ["none", "selective", "full"]
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-enable_fsdp_float8_all_gather = false
-precompute_float8_dynamic_scale_for_fsdp = false
+enable_fsdp_float8_all_gather = true
+precompute_float8_dynamic_scale_for_fsdp = true
 filter_fqns = ["output"]
+
+
+[fsdp2]
+cpu_offload.enable = true
+cpu_offload.pin_memory = true
