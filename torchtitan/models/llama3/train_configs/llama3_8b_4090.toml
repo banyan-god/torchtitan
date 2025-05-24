@@ -17,7 +17,11 @@ save_tb_folder = "tb"
 
 [model]
 name = "llama3"
-flavor = "8B"
+flavor = "1B"
+dim = 3072
+n_layers = 24
+n_heads = 24
+n_kv_heads = 8
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
 # converters = ["float8"]
 
