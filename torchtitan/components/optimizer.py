@@ -19,6 +19,7 @@ from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
+from torchtitan.distributed import ParallelDims
 
 __all__ = [
     "OptimizersContainer",
@@ -180,6 +181,7 @@ class FTOptimizersContainer(OptimizersContainer):
         optimizer_cls: type[T],
         optimizer_kwargs: dict[str, Any],
         ft_manager: "ft.Manager",
+        use_ft_optimizer: bool = True,
     ) -> None:
         super().__init__(model_parts, optimizer_cls, optimizer_kwargs)
 
@@ -192,7 +194,9 @@ class FTOptimizersContainer(OptimizersContainer):
         }
         self.cache_state_dict: dict[str, Any] = {}
         self._ft_optimizer = ft.Optimizer(ft_manager, self)
-        self._call_from_ft: bool = False
+        # Whether to determine quorum using FT.optimizer,
+        # in semi-sync training we use the synchronization step to start quorum
+        self._use_ft_optimizer: bool = use_ft_optimizer
 
     def init_cache_state_dict(self) -> None:
         self.cache_state_dict = super().state_dict()
@@ -211,34 +215,35 @@ class FTOptimizersContainer(OptimizersContainer):
     def step(self, *args, **kwargs) -> None:
         """Calling the correct step() depending on the caller.
 
-        TorchFT's OptimizerWrapper.step() is designed to be callled only once
+        TorchFT's OptimizerWrapper.step() is designed to be called only once
         per train step per ft.Manager regardless how many optimizers are used.
         Hence we will need to appropriately dispatch the call.
         """
-        if self._call_from_ft:
-            super().step(*args, **kwargs)
-        else:
-            self._call_from_ft = True
+        if self._use_ft_optimizer:
+            self._use_ft_optimizer = False
             self._ft_optimizer.step(*args, **kwargs)
-            self._call_from_ft = False
+            self._use_ft_optimizer = True
+        else:
+            super().step(*args, **kwargs)
 
     def zero_grad(self, *args, **kwargs) -> None:
         """Calling the correct zero_grad() depending on the caller.
 
         Check the comment in ``step()``.
         """
-        if self._call_from_ft:
-            super().zero_grad(*args, **kwargs)
-        else:
-            self._call_from_ft = True
+        if self._use_ft_optimizer:
+            self._use_ft_optimizer = False
             self._ft_optimizer.zero_grad(*args, **kwargs)
-            self._call_from_ft = False
+            self._use_ft_optimizer = True
+        else:
+            super().zero_grad(*args, **kwargs)
 
 
 def build_optimizers(
     model_parts: list[nn.Module],
     job_config: JobConfig,
-    ft_manager: FTManager,
+    parallel_dims: ParallelDims,
+    ft_manager: FTManager | None = None,
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
@@ -256,15 +261,29 @@ def build_optimizers(
     Args:
         model_parts (List[nn.Module]): List of model parts to be optimized.
         job_config (JobConfig): Job config containing the optimizer name and parameters.
+        parallel_dims (ParallelDims): Parallel dimensions for the model.
     """
     optim_in_bwd = job_config.optimizer.early_step_in_backward
-    if optim_in_bwd and job_config.parallelism.pipeline_parallel_degree > 1:
-        raise NotImplementedError(
-            "Optimizers in backward is not supported with pipeline parallelism."
-        )
+    if optim_in_bwd:
+        if parallel_dims.ep_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Expert Parallel."
+            )
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Pipeline Parallel."
+            )
+        if ft_manager and ft_manager.enabled:
+            raise NotImplementedError(
+                "TorchFT is not supported with optimizers in backward."
+            )
+
     name = job_config.optimizer.name
     lr = job_config.optimizer.lr
+    beta1 = job_config.optimizer.beta1
+    beta2 = job_config.optimizer.beta2
     eps = job_config.optimizer.eps
+    weight_decay = job_config.optimizer.weight_decay
 
     optim_implementation = job_config.optimizer.implementation
     assert optim_implementation in ["fused", "foreach", "for-loop"]
@@ -274,9 +293,9 @@ def build_optimizers(
 
     optimizer_kwargs = {
         "lr": lr,
+        "betas": (beta1, beta2),
         "eps": eps,
-        "betas": (0.9, 0.95),
-        "weight_decay": 0.1,
+        "weight_decay": weight_decay,
         "fused": fused,
         "foreach": foreach,
     }
@@ -289,15 +308,18 @@ def build_optimizers(
         raise NotImplementedError(f"Optimizer {name} not added.")
     optimizer_cls = optimizer_classes[name]
 
-    if optim_in_bwd and ft_manager.enabled:
-        raise ValueError("TorchFT is not supported with optimizers in backward.")
-    elif optim_in_bwd:
+    if optim_in_bwd:
         return OptimizersInBackwardContainer(
             model_parts, optimizer_cls, optimizer_kwargs
         )
-    elif ft_manager.enabled:
+
+    if ft_manager and ft_manager.enabled:
         return FTOptimizersContainer(
-            model_parts, optimizer_cls, optimizer_kwargs, ft_manager.manager
+            model_parts,
+            optimizer_cls,
+            optimizer_kwargs,
+            ft_manager.manager,
+            use_ft_optimizer=job_config.fault_tolerance.semi_sync_method is None,
         )
-    else:
-        return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
+
+    return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)

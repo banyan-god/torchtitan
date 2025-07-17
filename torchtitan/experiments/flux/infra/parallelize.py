@@ -21,7 +21,6 @@ from torchtitan.tools.logging import logger
 
 def parallelize_flux(
     model: nn.Module,
-    world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
@@ -36,7 +35,7 @@ def parallelize_flux(
 
         apply_fsdp(
             model,
-            world_mesh[tuple(dp_mesh_dim_names)],
+            parallel_dims.world_mesh[tuple(dp_mesh_dim_names)],
             param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
             cpu_offload=job_config.training.enable_cpu_offload,
@@ -92,6 +91,7 @@ def apply_fsdp(
             block,
             **fsdp_config,
         )
+
     # apply FSDP to last layer. Set reshard_after_forward=False for last layer to avoid gather right after reshard
     fully_shard(model.final_layer, **fsdp_config, reshard_after_forward=False)
 
@@ -116,7 +116,6 @@ def apply_ac(model: nn.Module, ac_config):
 def parallelize_encoders(
     t5_model: nn.Module,
     clip_model: nn.Module,
-    world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
@@ -131,23 +130,21 @@ def parallelize_encoders(
             reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
         )
         fsdp_config = {
-            "mesh": world_mesh[tuple(dp_mesh_dim_names)],
+            "mesh": parallel_dims.world_mesh[tuple(dp_mesh_dim_names)],
             "mp_policy": mp_policy,
         }
         if job_config.training.enable_cpu_offload:
             fsdp_config["offload_policy"] = CPUOffloadPolicy()
-        # FSDP for encoder blocks
-        for block in clip_model.hf_module.text_model.encoder.layers:
-            fully_shard(block, **fsdp_config)
-        fully_shard(clip_model, **fsdp_config)
 
+        # NOTE: only apply FSDP to the T5 encoder, not the CLIP text encoder.
+        # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
         for block in t5_model.hf_module.encoder.block:
             fully_shard(block, **fsdp_config)
         fully_shard(t5_model.hf_module, **fsdp_config)
 
         if parallel_dims.dp_replicate_enabled:
-            logger.info("Applied FSDP to the T5 and CLIP model")
+            logger.info("Applied FSDP to the T5 encoder model")
         else:
-            logger.info("Applied FSDP to the T5 and CLIP model")
+            logger.info("Applied FSDP to the T5 encoder model")
 
     return t5_model, clip_model

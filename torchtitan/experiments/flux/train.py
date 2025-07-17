@@ -5,26 +5,27 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 from torch.distributed.fsdp import FSDPModule
 
 from torchtitan.config_manager import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.experiments.flux.dataset.tokenizer import build_flux_tokenizer
-from torchtitan.experiments.flux.model.autoencoder import load_ae
-from torchtitan.experiments.flux.model.hf_embedder import FluxEmbedder
-from torchtitan.experiments.flux.parallelize_flux import parallelize_encoders
-from torchtitan.experiments.flux.sampling import generate_image, save_image
-from torchtitan.experiments.flux.utils import (
+from torchtitan.tools.logging import init_logger, logger
+from torchtitan.train import Trainer
+
+from .dataset.tokenizer import build_flux_tokenizer
+from .infra.parallelize import parallelize_encoders
+from .model.autoencoder import load_ae
+from .model.hf_embedder import FluxEmbedder
+from .sampling import generate_image, save_image
+from .utils import (
     create_position_encoding_for_latents,
     pack_latents,
     preprocess_data,
     unpack_latents,
 )
-from torchtitan.tools.logging import init_logger, logger
-from torchtitan.train import Trainer
 
 
 class FluxTrainer(Trainer):
@@ -35,7 +36,7 @@ class FluxTrainer(Trainer):
         # (mainly for debugging, expect perf loss).
         # For Flux model, we need distinct seed across FSDP ranks to ensure we randomly dropout prompts info in dataloader
         dist_utils.set_determinism(
-            self.world_mesh,
+            self.parallel_dims.world_mesh,
             self.device,
             job_config.training.seed,
             job_config.training.deterministic,
@@ -53,11 +54,11 @@ class FluxTrainer(Trainer):
         )
 
         # load components
-        model_config = self.train_spec.config[job_config.model.flavor]
+        model_args = self.train_spec.model_args[job_config.model.flavor]
 
         self.autoencoder = load_ae(
             job_config.encoder.autoencoder_path,
-            model_config.autoencoder_params,
+            model_args.autoencoder_params,
             device=self.device,
             dtype=self._dtype,
             random_init=job_config.training.test_mode,
@@ -76,12 +77,13 @@ class FluxTrainer(Trainer):
         self.t5_encoder, self.clip_encoder = parallelize_encoders(
             t5_model=self.t5_encoder,
             clip_model=self.clip_encoder,
-            world_mesh=self.world_mesh,
             parallel_dims=self.parallel_dims,
             job_config=job_config,
         )
 
-    def train_step(self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor):
+    def forward_backward_step(
+        self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
+    ) -> torch.Tensor:
         # generate t5 and clip embeddings
         input_dict["image"] = labels
         input_dict = preprocess_data(
@@ -94,17 +96,10 @@ class FluxTrainer(Trainer):
         )
         labels = input_dict["img_encodings"]
 
-        self.optimizers.zero_grad()
-
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
-        model_parts = self.model_parts
-        assert len(self.model_parts) == 1
         # explicitely convert flux model to be Bfloat16 no matter FSDP is applied or not
         model = self.model_parts[0]
-
-        world_mesh = self.world_mesh
-        parallel_dims = self.parallel_dims
 
         # image in latent space transformed by self.auto_encoder
         clip_encodings = input_dict["clip_encodings"]
@@ -112,16 +107,16 @@ class FluxTrainer(Trainer):
 
         bsz = labels.shape[0]
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.device(self.device):
             noise = torch.randn_like(labels)
-            timesteps = torch.rand((bsz,)).to(labels)
+            timesteps = torch.rand((bsz,))
             sigmas = timesteps.view(-1, 1, 1, 1)
             latents = (1 - sigmas) * labels + sigmas * noise
 
         bsz, _, latent_height, latent_width = latents.shape
 
         POSITION_DIM = 3  # constant for Flux flow model
-        with torch.no_grad():
+        with torch.no_grad(), torch.device(self.device):
             # Create positional encodings
             latent_pos_enc = create_position_encoding_for_latents(
                 bsz, latent_height, latent_width, POSITION_DIM
@@ -133,11 +128,11 @@ class FluxTrainer(Trainer):
 
         latent_noise_pred = model(
             img=latents,
-            img_ids=latent_pos_enc.to(latents),
-            txt=t5_encodings.to(latents),
-            txt_ids=text_pos_enc.to(latents),
-            y=clip_encodings.to(latents),
-            timesteps=timesteps.to(latents),
+            img_ids=latent_pos_enc,
+            txt=t5_encodings,
+            txt_ids=text_pos_enc,
+            y=clip_encodings,
+            timesteps=timesteps,
         )
 
         # Convert sequence of patches to latent shape
@@ -149,46 +144,7 @@ class FluxTrainer(Trainer):
         del (pred, noise, target)
         loss.backward()
 
-        dist_utils.clip_grad_norm_(
-            [p for m in model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=self.world_mesh["pp"] if parallel_dims.pp_enabled else None,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
-
-        # log metrics
-        if not self.metrics_processor.should_log(self.step):
-            return
-
-        if (
-            parallel_dims.dp_replicate_enabled
-            or parallel_dims.dp_shard_enabled
-            or parallel_dims.cp_enabled
-        ):
-            loss = loss.detach()
-            ft_pg = self.ft_manager.replicate_pg if self.ft_manager.enabled else None
-            global_avg_loss, global_max_loss = (
-                dist_utils.dist_mean(loss, world_mesh["dp_cp"], ft_pg),
-                dist_utils.dist_max(loss, world_mesh["dp_cp"], ft_pg),
-            )
-        else:
-            global_avg_loss = global_max_loss = loss.item()
-
-        self.metrics_processor.log(self.step, global_avg_loss, global_max_loss)
-
-        # Evaluate the model during training
-        if (
-            self.step % self.job_config.eval.eval_freq == 0
-            or self.step == self.job_config.training.steps
-        ):
-            model.eval()
-            # We need to set reshard_after_forward before last forward pass.
-            # So the model wieghts are sharded the same way for checkpoint saving.
-            self.eval_step()
-            model.train()
+        return loss
 
     def eval_step(self, prompt: str = "A photo of a cat"):
         """
@@ -231,6 +187,23 @@ class FluxTrainer(Trainer):
             if isinstance(module, FSDPModule):
                 module.reshard()
 
+    def train_step(
+        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
+        super().train_step(data_iterator)
+
+        # Evaluate the model during training
+        if (
+            self.step % self.job_config.eval.eval_freq == 0
+            or self.step == self.job_config.training.steps
+        ):
+            model = self.model_parts[0]
+            model.eval()
+            # We need to set reshard_after_forward before last forward pass.
+            # So the model wieghts are sharded the same way for checkpoint saving.
+            self.eval_step()
+            model.train()
+
 
 if __name__ == "__main__":
     init_logger()
@@ -247,14 +220,15 @@ if __name__ == "__main__":
             assert (
                 config.checkpoint.enable_checkpoint
             ), "Must enable checkpointing when creating a seed checkpoint."
-            trainer.checkpointer.save(curr_step=0, force=True)
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
-    finally:
+    except Exception:
         if trainer:
             trainer.close()
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            logger.info("Process group destroyed.")
+        raise
+    else:
+        trainer.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")
