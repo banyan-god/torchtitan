@@ -341,7 +341,6 @@ class Parallelism:
     The default value is 'allgather'.
     """
 
-
 @dataclass
 class Checkpoint:
     enable_checkpoint: bool = False
@@ -353,21 +352,47 @@ class Checkpoint:
     When enable_checkpoint is set to true, checkpoints will be in {--job.dump_folder}/{--checkpoint.folder}.
     """
 
+    initial_load_path: str | None = None
+    """
+    This option specifies the path to the initial checkpoint to load, which is
+    particularly useful for resuming training from a previous run with a
+    different output path or when loading a checkpoint from a pre-trained model.
+    If the checkpoint folder for the current run is not empty,
+    located at {--job.dump_folder}/{--checkpoint.folder}, this option will be ignored.
+    This feature allows users to load an initial checkpoint from a different folder and
+    continue training, saving new checkpoints to the specified folder without affecting
+    the existing ones.
+
+    Note that the path should contain the full path to the checkpoint folder,
+    including the step number, if any; for example,
+    "//pre_train/checkpoints/llama3/llama3_8b/step_10000".
+    """
+
+    initial_load_model_weights_only: bool = True
+    """
+    This option specifies if only the model weights should be loaded during the initial
+    checkpoint load. The option is only used when `initial_load_path` is specified.
+    If False, the checkpoint at `initial_load_path` is treated as a standard training
+    checkpoint, including optimizer and training states.
+    The default setting for this option is True. Note that you will have to use
+    `--checkpoint.no_initial_load_model_weights_only` to override the default setting.
+    """
+
     interval: int = 500
     """Checkpointing interval in steps."""
 
-    model_weights_only: bool = False
+    last_save_model_weights_only: bool = True
     """
-    When model_weights_only=True, only model weights will be saved at the end of training.
-    With this, checkpoints can be loaded using `torch.load(..., weights_only=True)` after conversion.
-    When model_weights_only=False, the full checkpoint will be saved.
+    When last_save_model_weights_only=True, only model weights will be saved at the end of training,
+    the last save.  With this, checkpoints can be loaded using `torch.load(..., weights_only=True)`
+    after conversion.  When last_save_model_weights_only=False, the full checkpoint will be saved.
     A full checkpoint includes model, optimizer and train_state, which can be used to resume training.
-    The default value is false.
+    The default value is True.
     """
 
     export_dtype: Literal["float16", "bfloat16", "float32"] = "float32"
     """
-    Converts to the specified precision when training completes and model_weights_only=true.
+    Converts to the specified precision when training completes and last_save_model_weights_only=true.
     """
 
     create_seed_checkpoint: bool = False
@@ -411,6 +436,24 @@ class Checkpoint:
     This will load the model only, excluding the specified keys.
     """
 
+    enable_first_step_checkpoint: bool = False
+    """
+    Enable the checkpoint save at first step. This will save a checkpoint immediately
+    after the first step to ensure checkpointing functions correctly. This is useful
+    when running on a new cluster or storage to verify checkpointing without waiting
+    for many steps or checkpointing too frequently. The default value is False.
+    """
+
+    last_save_in_safetensors_format: bool = False
+    """
+    Enable the use of safetensors format for checkpointing. This will save the final checkpoints
+    in safetensors format instead of the default DCP format. There will be a performance
+    cost in using this as we need to consolidate the sharded tensors to full tensors as
+    a separate step. last_save_model_weights_only must be true because safetensors doesn't
+    support saving non tensors. On load, this argument isn't needed as we will detect
+    whether the loaded checkpoint is in safetensors format or not.
+    The default value is False.
+    """
 
 @dataclass
 class ActivationCheckpoint:
