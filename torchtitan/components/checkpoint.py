@@ -334,7 +334,6 @@ class CheckpointManager:
                 self.purge_queue.put(Terminate())
                 self.purge_thread.join()
 
-    @torch.no_grad()
     def save(self, curr_step: int, force: bool = False) -> None:
         """Save the checkpoint for the current step.
 

@@ -424,8 +424,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 self.gc_handler.run(self.step)
                 self.train_step(inputs, labels)
+                # save checkpoint, passing force as positional arg to avoid decorator signature issues
                 self.checkpointer.save(
-                    self.step, force=(self.step == job_config.training.steps)
+                    self.step,
+                    (self.step == job_config.training.steps),
                 )
 
                 # signal the profiler that the next profiling step has started
