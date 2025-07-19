@@ -347,13 +347,22 @@ class CheckpointManager:
         storage_writer: HuggingFaceStorageWriter | None = None
         checkpoint_save_id: str | None = None
         if save_in_safetensors_format:
-            # Filter out meta tensors and move CPU copies to avoid invalid storages
+            # Prepare CPU copies and filter out tensors with invalid or empty storage
             sd_cpu: dict[str, Any] = {}
             for k, v in state_dict.items():
                 if isinstance(v, torch.Tensor):
-                    if v.device.type == "meta":
+                    try:
+                        tmp = v.clone().cpu()
+                        st = tmp.storage()
+                        # Access data_ptr to validate storage
+                        _ = st.data_ptr()
+                        # Skip empty storages
+                        if st.size() == 0:
+                            continue
+                        sd_cpu[k] = tmp
+                    except Exception:
+                        # drop tensors with invalid storage
                         continue
-                    sd_cpu[k] = v.clone().cpu()
                 else:
                     sd_cpu[k] = v
             state_dict = sd_cpu
@@ -399,7 +408,7 @@ class CheckpointManager:
                     storage_writer=storage_writer,
                     checkpoint_id=checkpoint_save_id,
                 )
-            except RuntimeError as e:
+            except Exception as e:
                 if save_in_safetensors_format:
                     logger.warning(
                         "safetensors save failed (%s), falling back to DCP format.", e
