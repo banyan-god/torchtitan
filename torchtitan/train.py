@@ -425,7 +425,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.gc_handler.run(self.step)
                 self.train_step(inputs, labels)
                 self.checkpointer.save(
-                    self.step, force=(self.step == job_config.training.steps)
+                    self.step, last_step=(self.step == job_config.training.steps)
                 )
 
                 # signal the profiler that the next profiling step has started
@@ -478,7 +478,7 @@ if __name__ == "__main__":
             assert (
                 config.checkpoint.enable_checkpoint
             ), "Must enable checkpointing when creating a seed checkpoint."
-            trainer.checkpointer.save(curr_step=0, force=True)
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
