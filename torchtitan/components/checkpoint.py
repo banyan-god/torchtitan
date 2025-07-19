@@ -724,27 +724,38 @@ class CheckpointManager:
         # dtype conversion when we are checkpoint model weights only and the
         # current dtype is not the same as the export dtype at the end of the training.
 
+        # Prepare states for final checkpoint
+        checkpoint_id = self._create_checkpoint_id(curr_step)
+        # Model-weights-only final export
         if self.last_save_model_weights_only:
-            states = self.states[MODEL].state_dict()
-
-            if self.export_dtype != torch.float32:
-                states = {k: v.to(self.export_dtype) for k, v in states.items()}
-            logger.info(
-                f"Saving a model weights only checkpoint in {self.export_dtype} "
-                f"at last step, step {curr_step}."
-            )
-        else:
-            logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
-            states = self._flattened_model_states_sd()
-
-        if self.last_save_in_safetensors_format:
-            assert (
-                self.last_save_model_weights_only
-            ), "Only model weights can be saved when saving in safetensors format."
-
+            # Only rank 0 writes the final weights
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                os.makedirs(checkpoint_id, exist_ok=True)
+                state = self.states[MODEL].state_dict()
+                if self.export_dtype != torch.float32:
+                    state = {k: v.to(self.export_dtype) for k, v in state.items()}
+                # Choose format: safetensors if enabled, else PyTorch
+                if self.last_save_in_safetensors_format:
+                    try:
+                        from safetensors.torch import save_file
+                        save_file(state, os.path.join(checkpoint_id, "model.safetensors"))
+                        logger.info(f"Saved model weights in safetensors at step {curr_step}.")
+                    except ImportError:
+                        path = os.path.join(checkpoint_id, "model_weights_only.pt")
+                        torch.save(state, path)
+                        logger.info(f"safetensors unavailable, saved model weights to {path}.")
+                else:
+                    path = os.path.join(checkpoint_id, "model_weights_only.pt")
+                    torch.save(state, path)
+                    logger.info(f"Saved model weights to {path} at step {curr_step}.")
+            return
+        # Full checkpoint via DCP
+        states = self._flattened_model_states_sd()
+        logger.info(f"Saving full checkpoint at last step, step {curr_step}.")
         self.dcp_save(
             states,
-            checkpoint_id=self._create_checkpoint_id(curr_step),
+            checkpoint_id=checkpoint_id,
             async_mode=AsyncMode.DISABLED,
             enable_garbage_collection=True,
             save_in_safetensors_format=self.last_save_in_safetensors_format,
